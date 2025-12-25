@@ -2,71 +2,61 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
 	"time"
 
 	enpal "github.com/arigon/enpal_data_collector"
 )
 
 func main() {
-	baseURL := "http://192.168.1.123" // Replace with your Enpal device IP
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	fmt.Printf("Connecting to Enpal device at %s...\n", baseURL)
+	// Create persistent client
+	client := enpal.NewClient("http://192.168.1.123")
 
-	rawJSON, data, err := enpal.FetchCollectorData(ctx, baseURL)
+	fmt.Println("Connecting to Enpal device...")
+	if err := client.Connect(ctx); err != nil {
+		log.Fatalf("Failed to connect: %v", err)
+	}
+	defer client.Close()
+
+	fmt.Println("✅ Connected! Fetching data every 30 seconds...")
+	fmt.Println("   Press Ctrl+C to stop")
+
+	// Handle graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt)
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	// Fetch immediately, then every 30 seconds
+	fetchAndPrint(client)
+
+	for {
+		select {
+		case <-ticker.C:
+			fetchAndPrint(client)
+		case <-sigChan:
+			fmt.Println("\nShutting down...")
+			return
+		}
+	}
+}
+
+func fetchAndPrint(client *enpal.Client) {
+	_, data, err := client.FetchData()
 	if err != nil {
-		log.Fatalf("Failed to fetch data: %v", err)
+		log.Printf("❌ Error: %v", err)
+		return
 	}
 
-	if data != nil {
-		fmt.Printf("\n=== Collector Data ===\n")
-		fmt.Printf("Collection ID: %s\n", data.CollectionID)
-		fmt.Printf("IoT Device ID: %s\n", data.IoTDeviceID)
-		fmt.Printf("Timestamp: %s\n", data.TimeStampUtc)
-
-		// Print number data points
-		if len(data.NumberDataPoints) > 0 {
-			fmt.Printf("\n--- Number Data Points ---\n")
-			for key, dp := range data.NumberDataPoints {
-				fmt.Printf("  %s: %v %s\n", key, dp.Value, dp.Unit)
-			}
-		}
-
-		// Print device collections
-		if len(data.DeviceCollections) > 0 {
-			fmt.Printf("\n--- Device Collections ---\n")
-			for _, dc := range data.DeviceCollections {
-				fmt.Printf("  Device: %s (%s)\n", dc.DeviceID, dc.DeviceClass)
-				for key, dp := range dc.NumberDataPoints {
-					fmt.Printf("    %s: %v %s\n", key, dp.Value, dp.Unit)
-				}
-			}
-		}
-
-		// Print energy management data
-		if len(data.EnergyManagement) > 0 {
-			fmt.Printf("\n--- Energy Management ---\n")
-			for _, em := range data.EnergyManagement {
-				fmt.Printf("  ID: %s\n", em.EnergyManagementID)
-				for key, dp := range em.NumberDataPoints {
-					fmt.Printf("    %s: %v %s\n", key, dp.Value, dp.Unit)
-				}
-			}
-		}
-	} else {
-		// Print raw JSON if parsing failed
-		fmt.Println("\nRaw JSON response:")
-		var prettyJSON map[string]interface{}
-		if err := json.Unmarshal([]byte(rawJSON), &prettyJSON); err == nil {
-			formatted, _ := json.MarshalIndent(prettyJSON, "", "  ")
-			fmt.Println(string(formatted))
-		} else {
-			fmt.Println(rawJSON)
-		}
-	}
+	fmt.Printf("[%s] ✅ %s - %d devices\n",
+		time.Now().Format("15:04:05"),
+		data.CollectionID[:8],
+		len(data.DeviceCollections))
 }

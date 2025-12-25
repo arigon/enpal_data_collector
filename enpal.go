@@ -10,13 +10,13 @@ import (
 	"net/http/cookiejar"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-// CollectorData represents the structure of the collector response
 type CollectorData struct {
 	CollectionID      string               `json:"collectionId"`
 	IoTDeviceID       string               `json:"ioTDeviceId"`
@@ -61,23 +61,21 @@ type EnergyManagement struct {
 	ErrorCodes         []ErrorCode          `json:"errorCodes"`
 }
 
-// FetchCollectorData connects to the Enpal device and fetches the current collector state.
-// baseURL should be like "http://192.168.1.123"
-// Returns the raw JSON string and parsed data, or an error.
-func FetchCollectorData(ctx context.Context, baseURL string) (string, *CollectorData, error) {
-	client := &enpalClient{baseURL: baseURL}
-	return client.fetch(ctx)
-}
-
-// enpalClient handles the Blazor WebSocket connection
-type enpalClient struct {
+// Client is a persistent connection to an Enpal device.
+// Use NewClient() to create, Connect() to establish connection,
+// FetchData() to get data (can be called multiple times), and Close() when done.
+type Client struct {
 	baseURL          string
 	conn             *websocket.Conn
 	httpClient       *http.Client
 	components       []componentDescriptor
 	applicationState string
+	ctx              context.Context
+	cancel           context.CancelFunc
 	resultChan       chan string
 	errorChan        chan error
+	mu               sync.Mutex
+	connected        bool
 }
 
 type componentDescriptor struct {
@@ -93,36 +91,48 @@ type componentKey struct {
 	FormattedComponentKey string `json:"formattedComponentKey"`
 }
 
-func (c *enpalClient) fetch(ctx context.Context) (string, *CollectorData, error) {
+// NewClient creates a new Enpal client for the given base URL (e.g., "http://192.168.1.123").
+func NewClient(baseURL string) *Client {
+	return &Client{baseURL: baseURL}
+}
+
+// Connect establishes the WebSocket connection and initializes the Blazor circuit.
+// Must be called before FetchData().
+func (c *Client) Connect(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.connected {
+		return nil
+	}
+
+	c.ctx, c.cancel = context.WithCancel(ctx)
 	c.resultChan = make(chan string, 1)
 	c.errorChan = make(chan error, 1)
 
-	// Create HTTP client with cookie jar
 	jar, _ := cookiejar.New(nil)
 	c.httpClient = &http.Client{Jar: jar, Timeout: 30 * time.Second}
 
-	// Step 1: Visit collector page to get session + components
 	collectorResp, err := c.httpClient.Get(c.baseURL + "/collector")
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to visit collector: %w", err)
+		return fmt.Errorf("failed to visit collector: %w", err)
 	}
 	htmlBytes, err := io.ReadAll(collectorResp.Body)
 	collectorResp.Body.Close()
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to read HTML: %w", err)
+		return fmt.Errorf("failed to read HTML: %w", err)
 	}
 
 	c.components = extractComponents(string(htmlBytes))
 	c.applicationState = extractAppState(string(htmlBytes))
 
 	if len(c.components) == 0 || c.applicationState == "" {
-		return "", nil, fmt.Errorf("failed to extract Blazor components from HTML")
+		return fmt.Errorf("failed to extract Blazor components from HTML")
 	}
 
-	// Step 2: Negotiate
 	resp, err := c.httpClient.Post(c.baseURL+"/_blazor/negotiate?negotiateVersion=1", "text/plain", nil)
 	if err != nil {
-		return "", nil, fmt.Errorf("negotiate failed: %w", err)
+		return fmt.Errorf("negotiate failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -130,10 +140,9 @@ func (c *enpalClient) fetch(ctx context.Context) (string, *CollectorData, error)
 		ConnectionToken string `json:"connectionToken"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&negResp); err != nil {
-		return "", nil, fmt.Errorf("decode negotiate failed: %w", err)
+		return fmt.Errorf("decode negotiate failed: %w", err)
 	}
 
-	// Step 3: Connect WebSocket
 	host := strings.TrimPrefix(c.baseURL, "http://")
 	wsURL := fmt.Sprintf("ws://%s/_blazor?id=%s", host, negResp.ConnectionToken)
 
@@ -148,142 +157,189 @@ func (c *enpalClient) fetch(ctx context.Context) (string, *CollectorData, error)
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
 	if err != nil {
-		return "", nil, fmt.Errorf("websocket dial failed: %w", err)
+		return fmt.Errorf("websocket dial failed: %w", err)
 	}
 	c.conn = conn
-	defer c.conn.Close()
 
-	// Step 4: Handshake
 	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"protocol":"blazorpack","version":1}`+"\x1e")); err != nil {
-		return "", nil, fmt.Errorf("handshake failed: %w", err)
+		c.conn.Close()
+		return fmt.Errorf("handshake failed: %w", err)
 	}
 
 	_, hsResp, err := conn.ReadMessage()
 	if err != nil {
-		return "", nil, fmt.Errorf("read handshake failed: %w", err)
+		c.conn.Close()
+		return fmt.Errorf("read handshake failed: %w", err)
 	}
 
 	var hs map[string]interface{}
 	if err := json.Unmarshal(bytes.TrimSuffix(hsResp, []byte{0x1e}), &hs); err != nil {
-		return "", nil, fmt.Errorf("parse handshake failed: %w", err)
+		c.conn.Close()
+		return fmt.Errorf("parse handshake failed: %w", err)
 	}
 	if errMsg, ok := hs["error"].(string); ok && errMsg != "" {
-		return "", nil, fmt.Errorf("handshake error: %s", errMsg)
+		c.conn.Close()
+		return fmt.Errorf("handshake error: %s", errMsg)
 	}
 
-	// Start message reader
-	go c.readLoop(ctx)
+	go c.readLoop()
 
-	// Step 5: StartCircuit
 	if err := c.sendStartCircuit(); err != nil {
-		return "", nil, fmt.Errorf("StartCircuit failed: %w", err)
+		c.conn.Close()
+		return fmt.Errorf("StartCircuit failed: %w", err)
 	}
-
 	time.Sleep(300 * time.Millisecond)
 
-	// Step 6: UpdateRootComponents
 	if err := c.sendUpdateRootComponents(); err != nil {
-		return "", nil, fmt.Errorf("UpdateRootComponents failed: %w", err)
+		c.conn.Close()
+		return fmt.Errorf("UpdateRootComponents failed: %w", err)
 	}
-
 	time.Sleep(500 * time.Millisecond)
 
-	// Step 7: Click button
+	c.connected = true
+	return nil
+}
+
+// FetchData clicks the button and waits for collector data.
+// Can be called multiple times on the same connection.
+func (c *Client) FetchData() (string, *CollectorData, error) {
+	c.mu.Lock()
+	if !c.connected {
+		c.mu.Unlock()
+		return "", nil, fmt.Errorf("not connected, call Connect() first")
+	}
+	c.mu.Unlock()
+
+	// Drain any old results
+	select {
+	case <-c.resultChan:
+	default:
+	}
+
 	if err := c.clickButton(4); err != nil {
 		return "", nil, fmt.Errorf("click button failed: %w", err)
 	}
 
-	// Wait for result with timeout
 	select {
 	case result := <-c.resultChan:
 		var data CollectorData
 		if err := json.Unmarshal([]byte(result), &data); err != nil {
-			return result, nil, nil // Return raw JSON if unmarshal fails
+			return result, nil, nil
 		}
 		return result, &data, nil
 	case err := <-c.errorChan:
+		c.mu.Lock()
+		c.connected = false
+		c.mu.Unlock()
 		return "", nil, err
 	case <-time.After(15 * time.Second):
 		return "", nil, fmt.Errorf("timeout waiting for data")
-	case <-ctx.Done():
-		return "", nil, ctx.Err()
+	case <-c.ctx.Done():
+		return "", nil, c.ctx.Err()
 	}
 }
 
-func (c *enpalClient) readLoop(ctx context.Context) {
+// Close closes the WebSocket connection.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.cancel != nil {
+		c.cancel()
+	}
+	c.connected = false
+	if c.conn != nil {
+		return c.conn.Close()
+	}
+	return nil
+}
+
+// IsConnected returns true if the client is connected.
+func (c *Client) IsConnected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.connected
+}
+
+// FetchCollectorData is a convenience function for one-shot data fetching.
+// It connects, fetches data, and closes the connection.
+func FetchCollectorData(ctx context.Context, baseURL string) (string, *CollectorData, error) {
+	client := NewClient(baseURL)
+	if err := client.Connect(ctx); err != nil {
+		return "", nil, err
+	}
+	defer client.Close()
+	return client.FetchData()
+}
+
+func (c *Client) readLoop() {
 	for {
 		select {
-		case <-ctx.Done():
+		case <-c.ctx.Done():
 			return
 		default:
 		}
-
 		_, data, err := c.conn.ReadMessage()
 		if err != nil {
-			c.errorChan <- fmt.Errorf("read error: %w", err)
+			select {
+			case c.errorChan <- fmt.Errorf("read error: %w", err):
+			default:
+			}
 			return
 		}
-
 		c.handleMessage(data)
 	}
 }
 
-func (c *enpalClient) handleMessage(data []byte) {
+func (c *Client) handleMessage(data []byte) {
 	reader := bytes.NewReader(data)
-
 	for reader.Len() > 0 {
 		length, err := readVLQ(reader)
 		if err != nil {
 			return
 		}
-
 		payload := make([]byte, length)
 		if _, err := io.ReadFull(reader, payload); err != nil {
 			return
 		}
-
 		var msg []interface{}
 		if err := msgpack.Unmarshal(payload, &msg); err != nil {
 			continue
 		}
-
 		if len(msg) < 4 {
 			continue
 		}
-
 		msgType := toInt64(msg[0])
-
-		if msgType == 1 { // Invocation
+		if msgType == 1 {
 			target, _ := msg[3].(string)
 			args, _ := msg[4].([]interface{})
-
 			switch target {
 			case "JS.RenderBatch":
 				if len(args) >= 1 {
-					batchID := toInt(args[0])
-					c.sendOnRenderCompleted(batchID)
+					c.sendOnRenderCompleted(toInt(args[0]))
 				}
 			case "JS.BeginInvokeJS":
 				if len(args) >= 3 {
 					taskID := toInt64(args[0])
 					identifier, _ := args[1].(string)
-
-					// Check for our data
 					if identifier == "blazorMonaco.editor.setValue" {
 						if dataStr, ok := args[2].(string); ok {
-							jsonData := extractJSON(dataStr)
-							if jsonData != "" {
-								c.resultChan <- jsonData
+							if jsonData := extractJSON(dataStr); jsonData != "" {
+								select {
+								case c.resultChan <- jsonData:
+								default:
+								}
 							}
 						}
 					}
-
-					// Send response
 					c.sendEndInvokeJS(taskID)
 				}
 			case "JS.Error":
 				if len(args) > 0 {
-					c.errorChan <- fmt.Errorf("server error: %v", args[0])
+					select {
+					case c.errorChan <- fmt.Errorf("server error: %v", args[0]):
+					default:
+					}
 				}
 			}
 		}
@@ -301,132 +357,88 @@ func extractJSON(rawData string) string {
 	return ""
 }
 
-func (c *enpalClient) sendMessage(msgArray []interface{}) error {
+func (c *Client) sendMessage(msgArray []interface{}) error {
 	payload, err := msgpack.Marshal(msgArray)
 	if err != nil {
 		return err
 	}
-
 	var buf bytes.Buffer
 	writeVLQ(&buf, len(payload))
 	buf.Write(payload)
-
 	return c.conn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
 }
 
-func (c *enpalClient) sendStartCircuit() error {
+func (c *Client) sendStartCircuit() error {
 	msg := []interface{}{
-		int64(1),
-		map[string]interface{}{},
-		"0",
-		"StartCircuit",
+		int64(1), map[string]interface{}{}, "0", "StartCircuit",
 		[]interface{}{c.baseURL + "/", c.baseURL + "/collector", "[]", c.applicationState},
 	}
 	return c.sendMessage(msg)
 }
 
-func (c *enpalClient) sendUpdateRootComponents() error {
+func (c *Client) sendUpdateRootComponents() error {
 	var operations []map[string]interface{}
 	for i, comp := range c.components {
 		operations = append(operations, map[string]interface{}{
-			"type":           "add",
-			"ssrComponentId": i + 1,
+			"type": "add", "ssrComponentId": i + 1,
 			"marker": map[string]interface{}{
-				"type":        comp.Type,
-				"prerenderId": comp.PrerenderID,
+				"type": comp.Type, "prerenderId": comp.PrerenderID,
 				"key": map[string]interface{}{
 					"locationHash":          comp.Key.LocationHash,
 					"formattedComponentKey": comp.Key.FormattedComponentKey,
 				},
-				"sequence":   comp.Sequence,
-				"descriptor": comp.Descriptor,
-				"uniqueId":   i,
+				"sequence": comp.Sequence, "descriptor": comp.Descriptor, "uniqueId": i,
 			},
 		})
 	}
-
-	batch := map[string]interface{}{
-		"batchId":    1,
-		"operations": operations,
-	}
+	batch := map[string]interface{}{"batchId": 1, "operations": operations}
 	batchJSON, _ := json.Marshal(batch)
-
 	msg := []interface{}{
-		int64(1),
-		map[string]interface{}{},
-		nil,
-		"UpdateRootComponents",
+		int64(1), map[string]interface{}{}, nil, "UpdateRootComponents",
 		[]interface{}{string(batchJSON), c.applicationState},
 	}
 	return c.sendMessage(msg)
 }
 
-func (c *enpalClient) clickButton(eventHandlerID int) error {
-	eventInfo := map[string]interface{}{
-		"eventHandlerId": eventHandlerID,
-		"eventName":      "click",
-		"eventFieldInfo": nil,
-	}
+func (c *Client) clickButton(eventHandlerID int) error {
+	eventInfo := map[string]interface{}{"eventHandlerId": eventHandlerID, "eventName": "click", "eventFieldInfo": nil}
 	eventArgs := map[string]interface{}{
 		"detail": 1, "button": 0, "buttons": 0,
-		"ctrlKey": false, "shiftKey": false, "altKey": false, "metaKey": false,
-		"type": "click",
+		"ctrlKey": false, "shiftKey": false, "altKey": false, "metaKey": false, "type": "click",
 	}
 	eventJSON, _ := json.Marshal([]interface{}{eventInfo, eventArgs})
-
 	msg := []interface{}{
-		int64(1),
-		map[string]interface{}{},
-		nil,
-		"BeginInvokeDotNetFromJS",
+		int64(1), map[string]interface{}{}, nil, "BeginInvokeDotNetFromJS",
 		[]interface{}{"1", nil, "DispatchEventAsync", int8(1), string(eventJSON)},
 	}
 	return c.sendMessage(msg)
 }
 
-func (c *enpalClient) sendOnRenderCompleted(batchID int) error {
-	msg := []interface{}{
-		int64(1),
-		map[string]interface{}{},
-		nil,
-		"OnRenderCompleted",
-		[]interface{}{int64(batchID), nil},
-	}
+func (c *Client) sendOnRenderCompleted(batchID int) error {
+	msg := []interface{}{int64(1), map[string]interface{}{}, nil, "OnRenderCompleted", []interface{}{int64(batchID), nil}}
 	return c.sendMessage(msg)
 }
 
-func (c *enpalClient) sendEndInvokeJS(taskID int64) error {
+func (c *Client) sendEndInvokeJS(taskID int64) error {
 	resultJSON := fmt.Sprintf("[%d,true,null]", taskID)
-	msg := []interface{}{
-		int64(1),
-		map[string]interface{}{},
-		nil,
-		"EndInvokeJSFromDotNet",
-		[]interface{}{taskID, true, resultJSON},
-	}
+	msg := []interface{}{int64(1), map[string]interface{}{}, nil, "EndInvokeJSFromDotNet", []interface{}{taskID, true, resultJSON}}
 	return c.sendMessage(msg)
 }
-
-// Helper functions
 
 func extractComponents(html string) []componentDescriptor {
 	pattern := regexp.MustCompile(`<!--Blazor:(\{.+?\})-->`)
 	matches := pattern.FindAllStringSubmatch(html, -1)
-
 	var components []componentDescriptor
 	for _, match := range matches {
 		if len(match) < 2 {
 			continue
 		}
-
 		jsonStr := strings.ReplaceAll(match[1], `\u002B`, "+")
 		jsonStr = strings.ReplaceAll(jsonStr, `\u002F`, "/")
-
 		var comp map[string]interface{}
 		if err := json.Unmarshal([]byte(jsonStr), &comp); err != nil {
 			continue
 		}
-
 		if compType, ok := comp["type"].(string); ok && compType == "server" {
 			if descriptor, ok := comp["descriptor"].(string); ok && descriptor != "" {
 				c := componentDescriptor{Type: compType, Descriptor: descriptor}

@@ -10,57 +10,93 @@ go get github.com/arigon/enpal_data_collector
 
 ## Usage
 
+### One-Shot Fetch
+
+For single data retrieval (connects, fetches, disconnects):
+
 ```go
-package main
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
 
-import (
-    "context"
-    "fmt"
-    "log"
-    "time"
+rawJSON, data, err := enpal.FetchCollectorData(ctx, "http://192.168.1.123")
+if err != nil {
+    log.Fatal(err)
+}
 
-    enpal "github.com/arigon/enpal_data_collector"
-)
+fmt.Printf("Devices: %d\n", len(data.DeviceCollections))
+```
 
-func main() {
-    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer cancel()
+### Persistent Connection
 
-    // Replace with your Enpal device IP
-    rawJSON, data, err := enpal.FetchCollectorData(ctx, "http://192.168.1.123")
+For periodic data collection (recommended for intervals < 5 minutes):
+
+```go
+client := enpal.NewClient("http://192.168.1.123")
+
+if err := client.Connect(ctx); err != nil {
+    log.Fatal(err)
+}
+defer client.Close()
+
+for {
+    rawJSON, data, err := client.FetchData()
     if err != nil {
-        log.Fatal(err)
+        log.Printf("Error: %v", err)
+        break
     }
-
-    if data != nil {
-        fmt.Printf("Collection ID: %s\n", data.CollectionID)
-        fmt.Printf("Timestamp: %s\n", data.TimeStampUtc)
-        
-        for key, dp := range data.NumberDataPoints {
-            fmt.Printf("%s: %.2f %s\n", key, dp.Value, dp.Unit)
-        }
-    }
+    
+    // Process data...
+    fmt.Printf("Collection: %s - %d devices\n", data.CollectionID, len(data.DeviceCollections))
+    
+    time.Sleep(30 * time.Second)
 }
 ```
 
-## Finding Your Device IP
+## API
 
-Your Enpal device should be accessible on your local network. Check your router's DHCP client list or use network scanning tools to find it.
+### Functions
+
+- `FetchCollectorData(ctx, baseURL)` - One-shot fetch (connects, gets data, disconnects)
+
+### Client Methods
+
+- `NewClient(baseURL)` - Create a new client
+- `Connect(ctx)` - Establish WebSocket connection
+- `FetchData()` - Fetch data (can be called multiple times)
+- `Close()` - Close connection
+- `IsConnected()` - Check connection status
 
 ## Data Structures
 
 ### CollectorData
 
-Main response containing:
+```go
+type CollectorData struct {
+    CollectionID      string
+    IoTDeviceID       string
+    TimeStampUtc      string
+    NumberDataPoints  map[string]DataPoint
+    TextDataPoints    map[string]DataPoint
+    DeviceCollections []DeviceCollection
+    EnergyManagement  []EnergyManagement
+    ErrorCodes        []ErrorCode
+}
+```
 
-- `CollectionID` - Unique collection identifier
-- `IoTDeviceID` - Device identifier  
-- `TimeStampUtc` - Timestamp of data collection
-- `NumberDataPoints` - Map of numeric measurements (power, voltage, etc.)
-- `TextDataPoints` - Map of text values
-- `DeviceCollections` - Data from individual devices (inverters, batteries)
-- `EnergyManagement` - Energy management system data
-- `ErrorCodes` - Any active error codes
+### DeviceCollection
+
+Contains data from individual devices (inverters, batteries, wallboxes):
+
+```go
+type DeviceCollection struct {
+    DeviceID         string
+    IngestionKey     string
+    DeviceClass      string  // "Inverter", "Battery", "Wallbox", etc.
+    TimeStampUtc     string
+    NumberDataPoints map[string]DataPoint
+    TextDataPoints   map[string]DataPoint
+}
+```
 
 ### DataPoint
 
@@ -68,21 +104,31 @@ Main response containing:
 type DataPoint struct {
     TimeStampUtcOfMeasurement string
     Unit                      string
-    Value                     any    // Can be float64 or string
+    Value                     any  // float64 or string
 }
 ```
 
-## Example
+## Finding Your Device IP
 
-See the [example](./example/main.go) for a complete usage example.
+Your Enpal device should be accessible on your local network. Check your router's DHCP client list or use:
 
 ```bash
-# Run the example
+# Scan local network
+nmap -sn 192.168.1.0/24
+```
+
+The device typically exposes a web interface at `http://<IP>/collector`.
+
+## Example
+
+See [example/main.go](./example/main.go) for a complete periodic collection example.
+
+```bash
 cd example
 go run main.go
 ```
 
 ## Dependencies
 
-- [gorilla/websocket](https://github.com/gorilla/websocket) - WebSocket client
-- [vmihailenco/msgpack](https://github.com/vmihailenco/msgpack) - MessagePack encoding
+- [gorilla/websocket](https://github.com/gorilla/websocket)
+- [vmihailenco/msgpack](https://github.com/vmihailenco/msgpack)
